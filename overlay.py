@@ -53,6 +53,8 @@ class OverlayWindow(QWidget):
         self.target_color_rgb = None
         self.show_grid = False
         self.grid_color = QColor(255, 255, 255, 180)
+        self.guide_color = QColor(255, 0, 0) # Default Highlight: Red
+        self.use_blink = False
         self.dot_w, self.dot_h = 100, 100
         self.pixmap = None
         self.start_pos = None
@@ -63,13 +65,12 @@ class OverlayWindow(QWidget):
         self.blink_timer.start(500)
 
     def toggle_blink(self):
-        if self.target_color_rgb:
+        if self.target_color_rgb and self.use_blink:
             self.blink_on = not self.blink_on
             self.update_display()
-        else:
-            if not self.blink_on:
-                self.blink_on = True
-                self.update_display()
+        elif not self.blink_on:
+            self.blink_on = True
+            self.update_display()
 
     def set_always_on_top(self, stay_on_top):
         flags = Qt.FramelessWindowHint | Qt.Tool
@@ -96,16 +97,16 @@ class OverlayWindow(QWidget):
             tr, tg, tb = self.target_color_rgb
             mask = (r == tr) & (g == tg) & (b == tb)
             
-            if self.blink_on:
-                data[mask, 0] = 255 - data[mask, 0]
-                data[mask, 1] = 255 - data[mask, 1]
-                data[mask, 2] = 255 - data[mask, 2]
+            if not self.use_blink or self.blink_on:
+                data[mask, 0] = self.guide_color.red()
+                data[mask, 1] = self.guide_color.green()
+                data[mask, 2] = self.guide_color.blue()
                 data[mask, 3] = 255 
             else:
-                data[mask, 3] = 255 
+                data[mask, 3] = 100 # Dimmed when blink is off
             
             data[~mask, 0:3] *= 0.1
-            data[~mask, 3] = 20
+            data[~mask, 3] = 30
 
         final_data = data.astype(np.uint8)
         filtered_img = Image.fromarray(final_data)
@@ -117,6 +118,7 @@ class OverlayWindow(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         if self.pixmap: painter.drawPixmap(0, 0, self.pixmap)
+        
         if self.show_grid and self.original_pil_img:
             painter.setPen(QPen(self.grid_color, 1))
             step_x, step_y = self.width() / self.dot_w, self.height() / self.dot_h
@@ -124,6 +126,12 @@ class OverlayWindow(QWidget):
                 curr_x = int(x * step_x); painter.drawLine(curr_x, 0, curr_x, self.height())
             for y in range(self.dot_h + 1):
                 curr_y = int(y * step_y); painter.drawLine(0, curr_y, self.width(), curr_y)
+
+        # Draw Chunk Position Info
+        if hasattr(self.panel, 'curr_chunk_pos'):
+            painter.setPen(QPen(Qt.red, 2))
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(self.rect().adjusted(0, 0, -10, -5), Qt.AlignRight | Qt.AlignBottom, f"Pos: {self.panel.curr_chunk_pos}")
 
     def mousePressEvent(self, event):
         if not self.is_locked: self.start_pos, self.start_geometry = event.globalPos(), self.geometry()
@@ -135,7 +143,7 @@ class OverlayWindow(QWidget):
             self.move(self.start_geometry.topLeft() + delta)
         else:
             self.resize(max(30, self.start_geometry.width() + delta.x()), max(30, self.start_geometry.height() + delta.y()))
-        self.panel.update_ui_from_overlay(); self.update_display()
+        self.update_display()
 
 class ControlPanel(QWidget):
     def __init__(self):
@@ -145,45 +153,103 @@ class ControlPanel(QWidget):
         self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("Art Helper v1.0")
-        self.setGeometry(1200, 100, 350, 850)
+        self.setWindowTitle("Art Helper v1.1")
+        self.setGeometry(1200, 100, 350, 900)
         layout = QVBoxLayout()
 
-        win_group = QGroupBox("Window Settings")
-        win_lay = QVBoxLayout()
+        # STEP 1: Canvas & Chunk Specification
+        step1_group = QGroupBox("STEP 1: Canvas & Chunk Settings")
+        step1_lay = QVBoxLayout()
+        
+        step1_lay.addWidget(QLabel("Canvas Specification:"))
+        self.combo = QComboBox()
+        self.combo.addItems(self.specs.keys())
+        step1_lay.addWidget(self.combo)
+
+        chunk_inputs = QHBoxLayout()
+        self.spin_chunk_w = QSpinBox(); self.spin_chunk_w.setRange(5, 500); self.spin_chunk_w.setValue(30)
+        self.spin_chunk_h = QSpinBox(); self.spin_chunk_h.setRange(5, 500); self.spin_chunk_h.setValue(30)
+        chunk_inputs.addWidget(QLabel("W:")); chunk_inputs.addWidget(self.spin_chunk_w)
+        chunk_inputs.addWidget(QLabel("H:")); chunk_inputs.addWidget(self.spin_chunk_h)
+        step1_lay.addLayout(chunk_inputs)
+        
+        step1_group.setLayout(step1_lay)
+        layout.addWidget(step1_group)
+
+        # STEP 2: Load Image
+        step2_group = QGroupBox("STEP 2: Image Action")
+        step2_lay = QVBoxLayout()
+        self.btn_load = QPushButton("Load Image & Apply Chunking")
+        self.btn_load.setFixedHeight(40) # 강조
+        self.btn_load.clicked.connect(self.load_image)
+        step2_lay.addWidget(self.btn_load)
+        
+        # Chunk Navigation (Moved here to manage loaded image)
+        nav_lay = QHBoxLayout()
+        self.btn_prev_chunk = QPushButton("< Prev")
+        self.btn_prev_chunk.clicked.connect(lambda: self.change_chunk(-1))
+        self.lbl_chunk_info = QLabel("Chunk: 0 / 0")
+        self.btn_next_chunk = QPushButton("Next >")
+        self.btn_next_chunk.clicked.connect(lambda: self.change_chunk(1))
+        nav_lay.addWidget(self.btn_prev_chunk); nav_lay.addWidget(self.lbl_chunk_info, 1, Qt.AlignCenter); nav_lay.addWidget(self.btn_next_chunk)
+        step2_lay.addLayout(nav_lay)
+        
+        step2_group.setLayout(step2_lay)
+        layout.addWidget(step2_group)
+
+        # STEP 3: Window Move & Resize
+        step3_group = QGroupBox("STEP 3: Adjust Overlay")
+        step3_lay = QVBoxLayout()
+        
+        mode_lay = QHBoxLayout()
+        self.mode_move = QRadioButton("Move Mode"); self.mode_resize = QRadioButton("Resize Mode")
+        self.mode_move.setChecked(True); mode_lay.addWidget(self.mode_move); mode_lay.addWidget(self.mode_resize)
+        step3_lay.addLayout(mode_lay)
+        
+        step3_lay.addWidget(QLabel("Window Opacity:"))
+        self.op_slider = QSlider(Qt.Horizontal); self.op_slider.setRange(10, 100); self.op_slider.setValue(70)
+        self.op_slider.valueChanged.connect(lambda v: self.overlay.setWindowOpacity(v/100))
+        step3_lay.addWidget(self.op_slider)
+        
         self.chk_ontop = QCheckBox("Always on Top")
         self.chk_ontop.setChecked(True)
         self.chk_ontop.toggled.connect(self.overlay.set_always_on_top)
-        win_lay.addWidget(self.chk_ontop)
-        
-        self.op_slider = QSlider(Qt.Horizontal); self.op_slider.setRange(10, 100); self.op_slider.setValue(70)
-        self.op_slider.valueChanged.connect(lambda v: self.overlay.setWindowOpacity(v/100))
-        win_lay.addWidget(QLabel("Opacity"))
-        win_lay.addWidget(self.op_slider)
-        win_group.setLayout(win_lay); layout.addWidget(win_group)
+        step3_lay.addWidget(self.chk_ontop)
 
-        layout.addWidget(QLabel("▣ Canvas Specification"))
-        self.combo = QComboBox(); self.combo.addItems(self.specs.keys()); layout.addWidget(self.combo)
+        step3_group.setLayout(step3_lay)
+        layout.addWidget(step3_group)
+
+        # STEP 4: Lock & Visual Helpers
+        step4_group = QGroupBox("STEP 4: Finalize & Filter")
+        step4_lay = QVBoxLayout()
         
-        mode_lay = QHBoxLayout()
-        self.mode_move = QRadioButton("Move"); self.mode_resize = QRadioButton("Resize")
-        self.mode_move.setChecked(True); mode_lay.addWidget(self.mode_move); mode_lay.addWidget(self.mode_resize)
-        layout.addLayout(mode_lay)
+        self.btn_lock = QPushButton("Lock Position")
+        self.btn_lock.setCheckable(True)
+        self.btn_lock.setFixedHeight(35)
+        self.btn_lock.clicked.connect(self.toggle_lock)
+        step4_lay.addWidget(self.btn_lock)
 
         grid_lay = QHBoxLayout()
         self.chk_grid = QCheckBox("Show Grid"); self.chk_grid.toggled.connect(lambda c: (setattr(self.overlay, 'show_grid', c), self.overlay.update()))
         self.btn_grid_clr = QPushButton("Grid B/W"); self.btn_grid_clr.clicked.connect(self.switch_grid_color)
-        grid_lay.addWidget(self.chk_grid); grid_lay.addWidget(self.btn_grid_clr); layout.addLayout(grid_lay)
+        grid_lay.addWidget(self.chk_grid); grid_lay.addWidget(self.btn_grid_clr)
+        step4_lay.addLayout(grid_lay)
 
-        self.btn_load = QPushButton("Load Image (Auto Palette)"); self.btn_load.clicked.connect(self.load_image); layout.addWidget(self.btn_load)
-        self.btn_lock = QPushButton("Lock Position"); self.btn_lock.setCheckable(True); self.btn_lock.clicked.connect(self.toggle_lock); layout.addWidget(self.btn_lock)
+        self.chk_blink = QCheckBox("Enable Blink"); self.chk_blink.toggled.connect(self.set_blink_mode)
+        self.btn_pick_guide = QPushButton("Set Highlight Color"); self.btn_pick_guide.clicked.connect(self.pick_guide_color)
+        step4_lay.addWidget(self.chk_blink); step4_lay.addWidget(self.btn_pick_guide)
+        
+        step4_group.setLayout(step4_lay)
+        layout.addWidget(step4_group)
 
-        layout.addWidget(QLabel("▣ Palette List (Used Colors):"))
-        self.color_list = QListWidget(); self.color_list.addItem("View All (Clear Filter)")
+        # Palette (Always bottom for reference)
+        layout.addWidget(QLabel("▣ Palette List (Current Chunk):"))
+        self.color_list = QListWidget()
         self.color_list.currentRowChanged.connect(self.apply_filter)
         layout.addWidget(self.color_list)
 
-        self.setLayout(layout); self.show()
+        self.setLayout(layout)
+        self.show()
 
     def switch_grid_color(self):
         self.overlay.grid_color = QColor(0,0,0,180) if self.overlay.grid_color == QColor(255,255,255,180) else QColor(255,255,255,180)
@@ -193,38 +259,60 @@ class ControlPanel(QWidget):
         fname = QFileDialog.getOpenFileName(self, 'Select Image', './')
         if fname[0]:
             w_dots, h_dots = self.specs[self.combo.currentText()]
-            self.overlay.dot_w, self.overlay.dot_h = w_dots, h_dots
-            
             img = Image.open(fname[0]).convert("RGB").resize((w_dots, h_dots), Image.Resampling.NEAREST)
             img_data = np.array(img)
             palette_colors = np.array(list(PALETTE_DATA.values()))
-            
             flat_img = img_data.reshape(-1, 3)
             distances = np.sqrt(np.sum((flat_img[:, np.newaxis] - palette_colors) ** 2, axis=2))
             nearest_indices = np.argmin(distances, axis=1)
-            
             new_img_data = palette_colors[nearest_indices].reshape(h_dots, w_dots, 3).astype(np.uint8)
-            self.pil_img = Image.fromarray(new_img_data)
             
-            self.overlay.update_display(self.pil_img)
-            self.overlay.show()
-            self.refresh_color_list()
+            self.full_pil_img = Image.fromarray(new_img_data)
+            self.update_chunk_view()
+
+    def update_chunk_view(self):
+        if not hasattr(self, 'full_pil_img'): return
+        cw, ch = self.spin_chunk_w.value(), self.spin_chunk_h.value()
+        self.cols = int(np.ceil(self.full_pil_img.width / cw))
+        self.rows = int(np.ceil(self.full_pil_img.height / ch))
+        self.total_chunks = self.rows * self.cols
+        self.curr_chunk_idx = 0
+        self.display_current_chunk()
+
+    def display_current_chunk(self):
+        cw, ch = self.spin_chunk_w.value(), self.spin_chunk_h.value()
+        r, c = self.curr_chunk_idx // self.cols, self.curr_chunk_idx % self.cols
+        self.curr_chunk_pos = f"[{c+1}, {r+1}]"
+        
+        left, top = c * cw, r * ch
+        right, bottom = min(left + cw, self.full_pil_img.width), min(top + ch, self.full_pil_img.height)
+        
+        self.pil_img = self.full_pil_img.crop((left, top, right, bottom))
+        self.overlay.dot_w, self.overlay.dot_h = self.pil_img.width, self.pil_img.height
+        self.overlay.update_display(self.pil_img)
+        self.lbl_chunk_info.setText(f"Chunk: {self.curr_chunk_idx + 1} / {self.total_chunks}")
+        self.refresh_color_list()
+        if self.overlay.width() <= 1:
+            self.overlay.resize(300, 300)
+        
+
+        self.overlay.update_display(self.pil_img)
+        self.overlay.show()
+        self.overlay.repaint() 
+
+    def change_chunk(self, delta):
+        if not hasattr(self, 'total_chunks'): return
+        self.curr_chunk_idx = (self.curr_chunk_idx + delta) % self.total_chunks
+        self.display_current_chunk()
 
     def refresh_color_list(self):
         try: self.color_list.currentRowChanged.disconnect()
         except: pass
-            
         self.color_list.clear()
         self.color_list.addItem("View All (Clear Filter)")
-        
         pixels = np.array(self.pil_img).reshape(-1, 3)
         unique_colors = {tuple(map(int, c)) for c in np.unique(pixels, axis=0)}
-        
-        found_keys = []
-        for key, rgb in PALETTE_DATA.items():
-            if tuple(map(int, rgb)) in unique_colors:
-                found_keys.append(key)
-        
+        found_keys = [k for k, v in PALETTE_DATA.items() if tuple(map(int, v)) in unique_colors]
         found_keys.sort(key=lambda x: [int(p) for p in x.split('-')])
 
         for key in found_keys:
@@ -232,7 +320,6 @@ class ControlPanel(QWidget):
             pix = QPixmap(18, 18); pix.fill(QColor(*PALETTE_DATA[key]))
             item.setIcon(QIcon(pix))
             self.color_list.addItem(item)
-        
         self.color_list.currentRowChanged.connect(self.apply_filter)
 
     def apply_filter(self, row):
@@ -241,12 +328,20 @@ class ControlPanel(QWidget):
             key = self.color_list.item(row).text()
             self.overlay.update_display(color_rgb=PALETTE_DATA[key])
 
+    def set_blink_mode(self, enabled):
+        self.overlay.use_blink = enabled
+        self.overlay.update_display()
+
+    def pick_guide_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.overlay.guide_color = color
+            self.overlay.update_display()
+
     def toggle_lock(self):
         locked = self.btn_lock.isChecked()
         self.overlay.set_lock(locked)
-        self.btn_lock.setText("Unlock" if locked else "Lock Position")
-
-    def update_ui_from_overlay(self): pass
+        self.btn_lock.setText("Unlock UI" if locked else "Lock Position")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv); ex = ControlPanel(); sys.exit(app.exec_())
